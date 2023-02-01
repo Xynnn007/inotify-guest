@@ -1,11 +1,11 @@
 //! use to inotify the creation of new tdx guest's vsocks
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ffi::OsStr};
 
 use anyhow::*;
-use inotify::{EventMask, Inotify, WatchMask};
+use inotify::{Event, EventMask, Inotify, WatchMask};
 use log::{info, warn};
-use tokio::process::Child;
+use tokio::{io, net::UnixStream, task::JoinHandle};
 
 const DRAGONBALL_WORKDIR: &str = "/var/lib/vc/dragonball";
 
@@ -13,23 +13,21 @@ const VSOCK_SUFFIX: &str = "/root/kata.hvsock_";
 
 const VSOCK_PREFIX: &str = "/var/lib/vc/dragonball/";
 
-pub struct Inotifier {
-    exec_cmd: String,
+pub struct Multiplexer {
     inotify: Inotify,
-    qgs_map: BTreeMap<String, Child>,
+    qgs_map: BTreeMap<String, JoinHandle<()>>,
 }
 
-impl Inotifier {
-    pub fn new(cmd: &str) -> Result<Self> {
+impl Multiplexer {
+    pub fn new() -> Result<Self> {
         let inotify = Inotify::init().context("inotify init failed")?;
         Ok(Self {
-            exec_cmd: cmd.into(),
             inotify,
             qgs_map: BTreeMap::new(),
         })
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    pub async fn start(&mut self, qgs_socket_path: &str) -> Result<()> {
         self.inotify
             .add_watch(DRAGONBALL_WORKDIR, WatchMask::CREATE | WatchMask::DELETE)
             .context("watch failed")?;
@@ -42,30 +40,48 @@ impl Inotifier {
 
         for event in events {
             if event.mask.contains(EventMask::CREATE) {
-                let name = event
-                    .name
-                    .ok_or_else(|| anyhow!("inotify catches empty filename"))?
-                    .to_string_lossy()
-                    .to_string();
+                let name = get_guest_id(event)?;
                 if name.ends_with(VSOCK_SUFFIX) && name.starts_with(VSOCK_PREFIX) {
-                    let id = name.trim_start_matches(VSOCK_PREFIX).trim_end_matches(VSOCK_SUFFIX);
-                    let cmd = tokio::process::Command::new(&self.exec_cmd)
-                        .spawn()
-                        .context("spawn qgs failed")?;
-                    self.qgs_map.insert(id.into(), cmd);
+                    let id = name
+                        .trim_start_matches(VSOCK_PREFIX)
+                        .trim_end_matches(VSOCK_SUFFIX);
+
+                    let qgs_socket = UnixStream::connect(qgs_socket_path)
+                        .await
+                        .context("dragonball unix socket bind")?;
+                    let (mut qgs_r, mut qgs_w) = qgs_socket.into_split();
+
+                    let guest_socket = UnixStream::connect(&name)
+                        .await
+                        .context("connect guest unix socket")?;
+                    let (mut guest_r, mut guest_w) = guest_socket.into_split();
+
+                    let slot = tokio::task::spawn(async move {
+                        let _ = tokio::try_join!(
+                            async {
+                                io::copy(&mut qgs_r, &mut guest_w)
+                                    .await
+                                    .context("qgs receive guest request failed")
+                            },
+                            async {
+                                io::copy(&mut guest_r, &mut qgs_w)
+                                    .await
+                                    .context("qgs  send guest response failed")
+                            }
+                        );
+                    });
+
+                    self.qgs_map.insert(id.into(), slot);
                 }
             } else if event.mask.contains(EventMask::DELETE) {
-                let name = event
-                    .name
-                    .ok_or_else(|| anyhow!("inotify catches empty filename"))?
-                    .to_string_lossy()
-                    .to_string();
+                let name = get_guest_id(event)?;
                 if name.ends_with(VSOCK_SUFFIX) && name.starts_with(VSOCK_PREFIX) {
-                    let id = name.trim_start_matches(VSOCK_PREFIX).trim_end_matches(VSOCK_SUFFIX);
-
+                    let id = name
+                        .trim_start_matches(VSOCK_PREFIX)
+                        .trim_end_matches(VSOCK_SUFFIX);
                     match self.qgs_map.get_mut(id) {
-                        Some(cmd) => {
-                            cmd.kill().await.context("guest qgs quit failed")?;
+                        Some(slot) => {
+                            slot.abort();
                             info!("guest id {id} qgs exited.");
                         }
                         None => warn!("guest id {id} exits but no qgs process found"),
@@ -76,4 +92,13 @@ impl Inotifier {
 
         Ok(())
     }
+}
+
+fn get_guest_id(event: Event<&OsStr>) -> Result<String> {
+    let res = event
+        .name
+        .ok_or_else(|| anyhow!("inotify catches empty filename"))?
+        .to_string_lossy()
+        .to_string();
+    Ok(res)
 }

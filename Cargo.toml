@@ -17,7 +17,7 @@ env_logger = "0.10.0"
 futures = "0.3.25"
 inotify = "0.10.0"
 log = "0.4.17"
-tokio = { version = "1.0", features = [ "process" ] }
+tokio = { version = "1.0", features = [ "process", "io-util", "rt", "macros" ] }
 
 [dev-dependencies]
 
