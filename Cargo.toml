@@ -6,7 +6,7 @@ publish = false
 edition = "2021"
 
 [[bin]]
-name = "main"
+name = "qgs-multiplexer"
 path = "bin/main.rs"
 required-features = [ "tokio/rt-multi-thread", "tokio/macros", "main" ]
 

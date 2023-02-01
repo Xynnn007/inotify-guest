@@ -7,7 +7,7 @@ If a new one is created, there will be a new connection between the socket file 
 build this binary
 
 ```bash
-cargo build --bin main --features="tokio/rt-multi-thread main tokio/macros" --release
+cargo build --bin qgs-multiplexer --features="tokio/rt-multi-thread main tokio/macros" --release
 ```
 
-And you can find in `target/release/main`
+And you can find in `target/release/qgs-multiplexer`
