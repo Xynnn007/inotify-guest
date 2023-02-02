@@ -1,22 +1,25 @@
 //! use to inotify the creation of new tdx guest's vsocks
 
-use std::{collections::BTreeMap, ffi::OsString};
+use std::{collections::BTreeMap, ffi::OsString, sync::Arc};
 
 use anyhow::*;
 use futures::TryStreamExt;
 use inotify::{Event, EventMask, Inotify, WatchMask};
-use log::{info, warn};
-use tokio::{io, net::UnixStream, task::JoinHandle};
+use log::{error, info, warn};
+use tokio::{
+    fs, io,
+    net::{UnixListener, UnixStream},
+    sync::{mpsc::Sender, Mutex},
+};
+use tokio_stream::wrappers::UnixListenerStream;
 
 const DRAGONBALL_WORKDIR: &str = "/var/lib/vc/dragonball";
 
-const VSOCK_SUFFIX: &str = "/root/kata.hvsock_";
-
-const VSOCK_PREFIX: &str = "/var/lib/vc/dragonball/";
+const VSOCK_NAME: &str = "kata.hvsock_40";
 
 pub struct Multiplexer {
     inotify: Inotify,
-    qgs_map: BTreeMap<String, JoinHandle<()>>,
+    qgs_map: Arc<Mutex<BTreeMap<String, Sender<usize>>>>,
 }
 
 impl Multiplexer {
@@ -24,7 +27,7 @@ impl Multiplexer {
         let inotify = Inotify::init().context("inotify init failed")?;
         Ok(Self {
             inotify,
-            qgs_map: BTreeMap::new(),
+            qgs_map: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -49,58 +52,38 @@ impl Multiplexer {
             };
 
             if event.mask.contains(EventMask::CREATE) {
-                let name = get_guest_id(event)?;
-                if name.ends_with(VSOCK_SUFFIX) && name.starts_with(VSOCK_PREFIX) {
-                    let id = name
-                        .trim_start_matches(VSOCK_PREFIX)
-                        .trim_end_matches(VSOCK_SUFFIX);
+                let id = get_guest_id(event)?;
+                fs::create_dir_all(format!("{DRAGONBALL_WORKDIR}/{id}/root")).await?;
+                info!("Create new guest id {id}");
 
-                    info!("Create new guest id {id}");
-                    let qgs_socket = UnixStream::connect(qgs_socket_path)
-                        .await
-                        .context("dragonball unix socket bind")?;
-                    let (mut qgs_r, mut qgs_w) = qgs_socket.into_split();
+                let guest_socket = format!("{DRAGONBALL_WORKDIR}/{id}/root/{VSOCK_NAME}");
+                let guest_socket =
+                    UnixListener::bind(guest_socket).context("connect guest unix socket")?;
+                let listener = UnixListenerStream::new(guest_socket);
 
-                    let guest_socket = UnixStream::connect(&name)
-                        .await
-                        .context("connect guest unix socket")?;
-                    let (mut guest_r, mut guest_w) = guest_socket.into_split();
-
-                    let slot = tokio::task::spawn(async move {
-                        let _ = tokio::try_join!(
-                            async {
-                                io::copy(&mut qgs_r, &mut guest_w)
-                                    .await
-                                    .context("qgs receive guest request failed")
-                            },
-                            async {
-                                io::copy(&mut guest_r, &mut qgs_w)
-                                    .await
-                                    .context("qgs send guest response failed")
-                            }
-                        );
-                    });
-
-                    self.qgs_map.insert(id.into(), slot);
-                }
+                let map = self.qgs_map.clone();
+                let qgs_socket_path = qgs_socket_path.to_string();
+                tokio::task::spawn(async move {
+                    listen_guest(listener, &qgs_socket_path, &id, map).await
+                });
             } else if event.mask.contains(EventMask::DELETE) {
-                let name = get_guest_id(event)?;
+                let id = get_guest_id(event)?;
+                info!("Remove guest id {id}");
 
-                if name.ends_with(VSOCK_SUFFIX) && name.starts_with(VSOCK_PREFIX) {
-                    let id = name
-                        .trim_start_matches(VSOCK_PREFIX)
-                        .trim_end_matches(VSOCK_SUFFIX);
-
-                    info!("Remove guest id {id}");
-
-                    match self.qgs_map.get_mut(id) {
-                        Some(slot) => {
-                            slot.abort();
-                            info!("guest id {id} qgs exited.");
+                match self.qgs_map.lock().await.get_mut(&id) {
+                    Some(sender) => {
+                        if sender.is_closed() {
+                            continue;
                         }
-                        None => warn!("guest id {id} exits but no qgs process found"),
+
+                        if let Err(e) = sender.send(0).await {
+                            error!("close connection via mpsc failed: {e}");
+                        }
                     }
+                    None => warn!("{id} exits but no qgs process found"),
                 }
+
+                let _ = self.qgs_map.lock().await.remove(&id);
             }
         }
 
@@ -115,4 +98,39 @@ fn get_guest_id(event: Event<OsString>) -> Result<String> {
         .to_string_lossy()
         .to_string();
     Ok(res)
+}
+
+async fn listen_guest(
+    mut listener: UnixListenerStream,
+    qgs_socket_path: &str,
+    id: &str,
+    tx_map: Arc<Mutex<BTreeMap<String, Sender<usize>>>>,
+) -> Result<()> {
+    while let std::result::Result::Ok(guest_socket) = listener.try_next().await {
+        let guest_socket = match guest_socket {
+            Some(inner) => inner,
+            None => continue,
+        };
+
+        let (mut gr, mut gw) = guest_socket.into_split();
+        let qsocket = UnixStream::connect(qgs_socket_path)
+            .await
+            .context("qgs unix socket bind")?;
+
+        let (mut qr, mut qw) = qsocket.into_split();
+        let id = id.to_string();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+        tx_map.lock().await.insert(id.clone(), tx);
+        tokio::spawn(async move {
+            tokio::select! {
+                Err(e) = io::copy(&mut gr, &mut qw) => error!("{id} connection failed: {e}"),
+                Err(e) = io::copy(&mut qr, &mut gw) => error!("{id} connection failed: {e}"),
+                Some(_) = rx.recv() => info!("{id} exits."),
+            };
+        });
+    }
+
+    Ok(())
 }
